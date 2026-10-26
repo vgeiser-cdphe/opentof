@@ -84,6 +84,8 @@ class Deployment:
         Polynomial function evaluating expected FWHM peak width as a function of m/z.
     peak_width_coeffs : numpy.ndarray or None
         Fitted polynomial coefficients for the peak width function.
+    peak_width_scatter : dict
+        Dictionary of "masses" and "fwhms" from the peak_width procedure
     tofdata_subtracted : dask.array.Array or None
         2D out-of-core Dask array containing baseline-subtracted spectral intensity values.
     peak_data : pandas.DataFrame or None
@@ -155,11 +157,15 @@ class Deployment:
         self.custom_peak_shape = None
         self.peak_width_function = None
         self.peak_width_coeffs = None
+        self.peak_width_scatter = None
         self.tofdata_subtracted = None
+        self.interactive = None
 
         # Master DataFrames for extracted peak fitting results and time-series
         self.peak_data = None
         self.time_series = None
+
+        self.apd_df = None
 
         # Block chunk size for parallel Dask matrix evaluations
         self.chunk_size = chunk_size
@@ -356,21 +362,21 @@ class Deployment:
         print("Step 2/6: Determining Instrument Type")
         obj.get_instrument_type()
 
-        # Step 3: Populate cycling status flags
-        print("Step 3/6: Populating deployment.cycling_status")
-        obj.build_cycling_status()
-
-        # Step 4: Construct out-of-core Dask TOF array
-        print("Step 4/6: Building deployment.tofdata")
+        # Step 3: Construct out-of-core Dask TOF array
+        print("Step 3/6: Building deployment.tofdata")
         obj.build_tofdata()
 
-        # Step 5: Compute initial first-guess mass axis
-        print("Step 5/6: Calculating deployment.first_guess_mass_axis")
+        # Step 4: Compute initial first-guess mass axis
+        print("Step 4/6: Calculating deployment.first_guess_mass_axis")
         obj.get_first_guess()
 
-        # Step 6: Enforce global chronological timestamp order across files
-        print("Step 6/6: Enforcing global chronological order")
+        # Step 5: Enforce global chronological timestamp order across files
+        print("Step 5/6: Enforcing global chronological order")
         obj.enforce_global_time_sort()
+
+        # Step 6: Populate cycling status flags
+        print("Step 6/6: Populating deployment.cycling_status")
+        obj.build_cycling_status()
         
         # Auto-seek and import existing Tofware processing files (_IF.h5 and _p.h5) if present
         try:
@@ -708,57 +714,22 @@ class Deployment:
     @property
     def nonstandard_acquisition_data(self):
         """
-        Return a boolean mask isolating non-standard acquisition scans.
-
-        Combines cycling status flags (auto-zeros, sensitivity calibrations), transient step 
-        padding windows, synthesized correction flags, manual user overrides, and physical 
-        writebuf truncation masks.
-
-        Returns
-        -------
-        numpy.ndarray of bool
-            1D array where ``True`` marks non-standard/bad scans (auto-zeros, cals, corrupt scans) 
-            and ``False`` marks valid ambient sampling scans.
+        Return a boolean mask isolating non-standard acquisition scans (zeros, calibrations, corrupt scans).
         """
-        # Return manual user override flags immediately if active
-        if getattr(self, '_user_entered_cycling_flag', False): 
-            return self._manual_nonstandard_flags
-
-        data = self.cycling_status
-        
-        # Check if valid cycling data is present (any flag != -1)
-        has_cycling = (data['type'] != -1).any()
-
-        if has_cycling:
-            # Mark any scan where type != 0 (non-standard sampling) as True
-            flags = (data['type'] != 0)
-
-            # Apply transient padding logic for native instrument cycling steps
-            is_step_two = (data['step'] == 2)
-            if is_step_two.any():
-                # Flag startup transient period (scans before the first step 2 event)
-                first_step_two_idx = is_step_two.argmax()
-                flags[:first_step_two_idx] = True
-
-            # Handle Step 5 (Sensitivity Calibration) transients with rolling padding
-            is_step_five = (data['step'] == 5)
-            if is_step_five.any():
-                pad_before = np.roll(is_step_five, -2)
-                pad_after = np.roll(is_step_five, 2)
-                
-                # Prevent wrap-around boundary padding
-                pad_before[-1] = False 
-                pad_after[0] = False
-                
-                # Combine step 5 and adjacent transient buffer scans
-                flags = flags | is_step_five | pad_before | pad_after
-
+        # 1. Genuine manual override takes precedence
+        if getattr(self, '_user_entered_cycling_flag', False):
+            flags = self._manual_nonstandard_flags.copy()
         else:
-            # Fallback: Assume all spectra are standard acquisition scans if cycling telemetry is missing
-            length = self.tofdata.shape[0] if self.tofdata is not None else 0
-            flags = np.zeros(length, dtype=bool)
+            # 2. Dynamic evaluation from cycling ground truth
+            type_arr = self.cycling_status.get('type', None)
+            if type_arr is not None:
+                # Ambient is 0; Auto-Zero (1), Sensitivity Cal (4), and startup (-1) are non-standard
+                flags = (type_arr != 0)
+            else:
+                length = self.tofdata.shape[0] if self.tofdata is not None else 0
+                flags = np.zeros(length, dtype=bool)
 
-        # Combine corrupt writebuf mask into non-standard acquisition flags via bitwise OR
+        # 3. Always include physically corrupted writebufs
         if getattr(self, '_corrupt_flags', None) is not None and len(self._corrupt_flags) == len(flags):
             flags = flags | self._corrupt_flags
 
@@ -875,81 +846,159 @@ class Deployment:
         return self._cache[group_name]
 
 
-    def build_cycling_status(self):
+    def build_cycling_status(self,
+                         prefer_physical_telemetry=True,
+                         zero_mfc_thresh=50.0,
+                         cal_mfc_thresh=1.0,
+                         min_ambient_points=5,
+                         mismatch_tolerance=0.10,
+                         plot_flag=False,
+                         output_dir=None,
+                         plot_filename="cycling_status.png"):
         """
-        Build the combined 1D cycling status dictionary across all loaded acquisition files.
-
-        Extracts native cycling flags (`'type'`, `'step'`, etc.) from raw files. If native 
-        cycling telemetry is absent (all ``-1`` values), synthesizes auto-zero (type ``1``) 
-        and sensitivity calibration (type ``4``) event masks directly from HDF5 
-        ``'Corrections'`` dataset tables.
-
-        Returns
-        -------
-        None
-            Populates `self._cycling_status` in-place.
+        Build unified instrument cycling status, prioritizing physical flows and valves as ground truth.
         """
+        n_spectra = len(self.timestamps)
+        
+        # -------------------------------------------------------------
+        # 1. Extract Programmed Table & Legacy Corrections
+        # -------------------------------------------------------------
         combined = {}
-
-        # Extract raw per-file cycling flags into self.cycling_values
         self.extract_cycling_flags()
-
-        # Flatten and collect cycling arrays across files
         for data in self.cycling_values.values():
             for key, arr in data.items():
-                arr_flat = arr.ravel()
-                combined.setdefault(key, []).append(arr_flat)
-
-        # Concatenate file-level cycling arrays
+                combined.setdefault(key, []).append(arr.ravel())
+        
         self._cycling_status = {key: np.concatenate(arrs) for key, arrs in combined.items()}
-
-        # --- FALLBACK HIERARCHY FOR SYNTHESIZING CYCLING FLAGS ---
-        # If native type array contains all -1s (missing telemetry), synthesize flags from 'Corrections' group
-        if (self._cycling_status['type'] == -1).all():
-            
-            # Check if any file handle contains a 'Corrections' HDF5 group
-            has_corrections = any('Corrections' in h5 for h5 in self._file_handles.values())
-
-            if has_corrections:
-                synth_type_list = []
+        
+        # Apply global time sort if active
+        if getattr(self, '_global_sort_idx', None) is not None:
+            for k in self._cycling_status:
+                self._cycling_status[k] = self._cycling_status[k][self._global_sort_idx]
                 
+        # Fallback to HDF5 Corrections if table is unpopulated (all -1)
+        if (self._cycling_status.get('type', np.full(n_spectra, -1)) == -1).all():
+            if any('Corrections' in h5 for h5 in self._file_handles.values()):
+                synth_type_list = []
                 for k in sorted(self._file_handles.keys()):
                     h5 = self._file_handles[k]
-                    
-                    # Extract dataset dimensions to convert (write, buf) tuples to flat 1D indices
                     d1, d2 = h5['FullSpectra/TofData'].shape[:2]
-                    num_bufs = d2
-                    total_len = d1 * d2
-                    
-                    file_synth_type = np.zeros(total_len, dtype=np.int32)
-                    
-                    # Parse background/auto-zero intervals from Corrections/Background/Data
-                    if 'Corrections' in h5 and 'Background/Data' in h5['Corrections']:
-                        bg_data = h5['Corrections/Background/Data'][:]
-                        for row in bg_data:
-                            # Map (write_start, buf_start) -> 1D start index; (write_stop, buf_stop) -> 1D stop index
-                            start_idx = int(row[1]) * num_bufs + int(row[2])
-                            end_idx = int(row[7]) * num_bufs + int(row[8])
-                            
-                            # Assign type flag 1 for auto-zero / background
-                            file_synth_type[start_idx:end_idx + 1] = 1
-                            
-                    # Parse sensitivity calibration intervals from Corrections/Calibration/Data
-                    if 'Corrections' in h5 and 'Calibration/Data' in h5['Corrections']:
-                        cal_data = h5['Corrections/Calibration/Data'][:]
-                        for row in cal_data:
-                            start_idx = int(row[1]) * num_bufs + int(row[2])
-                            end_idx = int(row[7]) * num_bufs + int(row[8])
-                            
-                            # Assign type flag 4 for sensitivity calibration
-                            file_synth_type[start_idx:end_idx + 1] = 4
-                            
-                    # Apply per-file timestamp sorting mask
-                    file_synth_type = file_synth_type[self._sort_indices[k]]
-                    synth_type_list.append(file_synth_type)
-                    
-                # Overwrite default -1 array with synthesized cycling type flags
-                self._cycling_status['type'] = np.concatenate(synth_type_list)
+                    file_type = np.zeros(d1 * d2, dtype=np.int32)
+                    if 'Corrections/Background/Data' in h5:
+                        for row in h5['Corrections/Background/Data'][:]:
+                            file_type[int(row[1])*d2 + int(row[2]) : int(row[7])*d2 + int(row[8]) + 1] = 1
+                    if 'Corrections/Calibration/Data' in h5:
+                        for row in h5['Corrections/Calibration/Data'][:]:
+                            file_type[int(row[1])*d2 + int(row[2]) : int(row[7])*d2 + int(row[8]) + 1] = 4
+                    synth_type_list.append(file_type[self._sort_indices[k]])
+                raw_corrections = np.concatenate(synth_type_list)
+                if getattr(self, '_global_sort_idx', None) is not None:
+                    raw_corrections = raw_corrections[self._global_sort_idx]
+                self._cycling_status['type'] = raw_corrections
+
+        table_status = self._cycling_status.get('type', np.full(n_spectra, -1)).copy()
+        has_table_cycling = np.any(np.isin(table_status, [1, 4]))
+
+        # -------------------------------------------------------------
+        # 2. Derive Physical Truth from Valves & MFC Telemetry
+        # -------------------------------------------------------------
+        has_tps2 = hasattr(self, 'tps2') and bool(self.tps2)
+        has_valves = has_tps2 and any('valve' in k.lower() for k in self.tps2.keys())
+        has_mfc = has_tps2 and any('mfc' in k.lower() for k in self.tps2.keys())
+        can_derive_physical = prefer_physical_telemetry and (has_valves or has_mfc)
+
+        if can_derive_physical:
+            # Extract MFC flows
+            zero_flow, cal_flow = None, None
+            for k, v in self.tps2.items():
+                kl = k.lower()
+                if 'mfc' in kl:
+                    if 'zero' in kl and zero_flow is None:
+                        zero_flow = np.asarray(v, dtype=float)
+                    elif 'cal' in kl and cal_flow is None:
+                        cal_flow = np.asarray(v, dtype=float)
+
+            # Extract Valve States
+            cal_valve, zero_valve = None, None
+            for k, v in self.tps2.items():
+                kl = k.lower()
+                if 'valve' in kl:
+                    is_open = (np.asarray(v) == 1)
+                    if 'pr1' in kl or 'cal' in kl:
+                        cal_valve = is_open if cal_valve is None else (cal_valve | is_open)
+                    elif 'pr2' in kl or 'zero' in kl:
+                        zero_valve = is_open if zero_valve is None else (zero_valve | is_open)
+
+            # Establish Flow Thresholds
+            zero_flowing = (zero_flow > zero_mfc_thresh) if (zero_flow is not None and len(zero_flow) == n_spectra) else True
+            cal_flowing = (cal_flow > cal_mfc_thresh) if (cal_flow is not None and len(cal_flow) == n_spectra) else True
+
+            # Phase 4 (Cal Challenge): Cal valve open & cal gas flowing
+            is_cal = (cal_valve & cal_flowing) if cal_valve is not None else (cal_flowing if cal_flow is not None else np.zeros(n_spectra, bool))
+            
+            # Phase 1 (Auto-Zero Air): Zero valve open & zero air flowing (Cal OFF)
+            is_zero = ((zero_valve & zero_flowing) & ~is_cal) if zero_valve is not None else ((zero_flowing & ~is_cal) if zero_flow is not None else np.zeros(n_spectra, bool))
+
+            physical_status = np.zeros(n_spectra, dtype=np.int32)
+            physical_status[is_zero] = 1
+            physical_status[is_cal] = 4
+
+            # Run-length filter: eliminate transient valve chatter / dropouts
+            if min_ambient_points > 1:
+                i = 0
+                while i < n_spectra:
+                    if physical_status[i] == 0:
+                        start = i
+                        while i < n_spectra and physical_status[i] == 0:
+                            i += 1
+                        run_len = i - start
+                        if run_len < min_ambient_points:
+                            prev_val = physical_status[start - 1] if start > 0 else None
+                            next_val = physical_status[i] if i < n_spectra else None
+                            if prev_val == next_val and prev_val is not None:
+                                physical_status[start:i] = prev_val
+                            elif prev_val is not None and next_val is not None:
+                                mid = start + (run_len // 2)
+                                physical_status[start:mid] = prev_val
+                                physical_status[mid:i] = next_val
+                    else:
+                        i += 1
+
+            # Audit against scheduled table if one was present
+            discrepancy_log = []
+            if has_table_cycling:
+                from opentof.quantification import _locate_index_chunks
+                self._original_cycling_status = table_status.copy()
+                for phase_id, phase_name in [(1, "Auto-Zero"), (4, "Sensitivity Cal")]:
+                    prog_indices = np.where(table_status == phase_id)[0]
+                    if len(prog_indices) == 0:
+                        continue
+                    for chunk in _locate_index_chunks(prog_indices, gap_tol=5, min_chunk_size=1):
+                        start_i, end_i = chunk[0], chunk[-1] + 1
+                        agreement = np.sum(physical_status[start_i:end_i] == phase_id) / (end_i - start_i)
+                        if (1.0 - agreement) > mismatch_tolerance:
+                            discrepancy_log.append({
+                                'phase': phase_name, 'start': start_i, 'end': end_i,
+                                'agreement': agreement, 'reason': 'Valve stuck closed or flow missing'
+                            })
+                self.cycling_reconciliation_log = discrepancy_log
+
+            final_status = physical_status
+        else:
+            # Fallback to DAQ table
+            final_status = table_status
+            if not has_table_cycling:
+                final_status = np.zeros(n_spectra, dtype=np.int32)
+
+        # -------------------------------------------------------------
+        # 3. Direct State Assignment (No Setter Invocation)
+        # -------------------------------------------------------------
+        self._cycling_status['type'] = final_status
+
+        if plot_flag:
+            self._plot_cycling_diagnostics(table_status, final_status, output_dir, plot_filename)
+
+        return self
 
     def build_tofdata(self):
         """
@@ -1893,7 +1942,7 @@ class Deployment:
         # Execute selected peak width parameterization algorithm
         if mode == 'ransac':
             print("Determining peak width using RANSAC regression...")
-            fit_coeffs, offset_coeffs, rp_popt = ransac_peak_width(
+            fit_coeffs, offset_coeffs, rp_popt, filtered_peak_data = ransac_peak_width(
                 reference_spectrum=self.baseline['baseline_adjusted_spectrum'],
                 rs_mass_axis=self.reference['rs_mass_axis'],
                 plot_flag=plot_flag,
@@ -1901,7 +1950,7 @@ class Deployment:
             )
         else:
             print("Determining peak width using iterative refinement...")
-            fit_coeffs, rp_popt = peak_width(
+            fit_coeffs, rp_popt, filtered_peak_data = peak_width(
                 reference_spectrum=self.baseline['baseline_adjusted_spectrum'],
                 rs_mass_axis=self.reference['rs_mass_axis'],
                 plot_flag=plot_flag,
@@ -1923,6 +1972,13 @@ class Deployment:
 
         # Construct mass-dependent resolving power callable function RP(m) = a * m^b
         self.resolving_power_function = lambda m: rp_popt[0] * (m ** rp_popt[1])
+
+        pw_scatter_points = {
+            "masses": filtered_peak_data[:, 0],
+            "fwhms": filtered_peak_data[:, 1]
+        }
+
+        self.peak_width_scatter = pw_scatter_points
         
         # Return self instance to enable method chaining
         return self
@@ -3186,218 +3242,9 @@ class Deployment:
         self.diagnostic_fits[f"unconstrained_{nominal_mass}"] = result
         return result
 
-    def synthesize_cycling_status(self, 
-                                  overwrite=False,
-                                  min_ambient_points=30,
-                                  zero_mfc_thresh=50.0, 
-                                  cal_mfc_thresh=1.0, 
-                                  plot_flag=True, 
-                                  output_dir=None, 
-                                  plot_filename="deployment_cycling.png"):
-        """
-        Reconstruct d.cycling_status['type'] and d.standard_acquisition_data using
-        MFC flow monitors and valve target telemetry from TPS2.
 
-        Includes run-length filtering to eliminate transient 'ambient' blips (1-point
-        dropouts or valve-switching chatter) by absorbing them into the surrounding
-        non-standard cycling phases.
-
-        Parameters
-        ----------
-        overwrite : bool, default=False
-            If False and the deployment already has valid cycling flags (type 1 or 4),
-            synthesis is skipped to protect ground truth data.
-        min_ambient_points : int, default=30
-            Minimum number of consecutive spectra required to qualify as legitimate
-            ambient acquisition data. Any run of status == 0 shorter than this threshold
-            is disallowed and absorbed into the adjacent cycling events.
-        zero_mfc_thresh : float, default=50.0
-            Minimum flow (sccm) on the Zero MFC to classify as active zero air overflow.
-        cal_mfc_thresh : float, default=1.0
-            Minimum flow (sccm) on the Cal MFC to classify as active calibration challenge.
-        plot_flag : bool, default=True
-            If True, saves a 2-panel verification plot of the cycle status and flows.
-        output_dir : str or None, default=None
-            Target directory for the plot. Defaults to OpenTof default plot dir.
-        plot_filename : str, default="deployment_cycling.png"
-            Filename for the exported diagnostic plot.
-
-        Returns
-        -------
-        self : Deployment
-            The Deployment instance.
-        """
-        # --- 1. Ground Truth Protection Guardrail ---
-        current_type = getattr(self, 'cycling_status', {}).get('type', None)
-        has_existing_cycling = (
-            current_type is not None and 
-            np.any(np.isin(current_type, [1, 4]))
-        )
-
-        if has_existing_cycling and not overwrite:
-            n_zeros = np.sum(current_type == 1)
-            n_cals = np.sum(current_type == 4)
-            print(
-                f"ℹ️ Valid cycling table already present ({n_zeros} zero points, {n_cals} cal points). "
-                f"Skipping synthesis. Pass `overwrite=True` if you wish to re-derive from flows/valves."
-            )
-            return self
-
-        # --- 2. Telemetry Availability Guard ---
-        if not hasattr(self, 'tps2') or not self.tps2:
-            warnings.warn("No TPS2 telemetry found in deployment. Cannot synthesize cycling status.")
-            return self
-
-        n_spectra = len(self.timestamps)
-        status = np.zeros(n_spectra, dtype=np.int32)
-
-        # --- 3. Extract Mass Flow Controller Monitors from TPS2 ---
-        zero_flow = None
-        cal_flow = None
-        for k in self.tps2.keys():
-            k_low = k.lower()
-            if 'mfc' in k_low:
-                if 'zero' in k_low and zero_flow is None:
-                    zero_flow = np.asarray(self.tps2[k], dtype=float)
-                elif 'cal' in k_low and cal_flow is None:
-                    cal_flow = np.asarray(self.tps2[k], dtype=float)
-
-        # --- 4. Extract Valve Target State Commands ---
-        cal_valve = None
-        zero_valve = None
-        for k in self.tps2.keys():
-            k_low = k.lower()
-            if 'valve' in k_low:
-                if 'pr1' in k_low or 'cal' in k_low:
-                    cal_valve = (np.asarray(self.tps2[k]) == 1)
-                elif 'pr2' in k_low or 'zero' in k_low:
-                    zero_valve = (np.asarray(self.tps2[k]) == 1)
-
-        # --- 5. Establish Physical Active Flow Conditions ---
-        zero_flowing = (zero_flow > zero_mfc_thresh) if (zero_flow is not None and len(zero_flow) == n_spectra) else True
-        cal_flowing = (cal_flow > cal_mfc_thresh) if (cal_flow is not None and len(cal_flow) == n_spectra) else True
-
-        # Phase 4 (Sensitivity Cal Challenge): Cal gas flowing & cal valve open
-        if cal_valve is not None:
-            is_cal = cal_valve & cal_flowing
-        elif cal_flow is not None:
-            is_cal = cal_flow > cal_mfc_thresh
-        else:
-            is_cal = np.zeros(n_spectra, dtype=bool)
-
-        # Phase 1 (Auto-Zero Air): Zero air flowing & zero valve open, with Cal gas OFF
-        if zero_valve is not None:
-            is_zero = (zero_valve & zero_flowing) & ~is_cal
-        elif zero_flow is not None:
-            is_zero = (zero_flow > zero_mfc_thresh) & ~is_cal
-        else:
-            is_zero = np.zeros(n_spectra, dtype=bool)
-
-        status[is_zero] = 1
-        status[is_cal] = 4
-
-        # --- 6. RUN-LENGTH FILTER: ABSORB SHORT TRANSIENT AMBIENT RUNS ---
-        # Any stretch of status == 0 shorter than min_ambient_points is an artifact
-        if min_ambient_points > 1:
-            i = 0
-            absorbed_blips = 0
-            while i < n_spectra:
-                if status[i] == 0:
-                    start = i
-                    while i < n_spectra and status[i] == 0:
-                        i += 1
-                    end = i
-                    run_len = end - start
-
-                    # If the ambient period is too short, bridge it into the surrounding cycle
-                    if run_len < min_ambient_points:
-                        absorbed_blips += 1
-                        prev_val = status[start - 1] if start > 0 else None
-                        next_val = status[end] if end < n_spectra else None
-
-                        if prev_val is not None and next_val is not None:
-                            if prev_val == next_val:
-                                # Bridge across single-point dips during zero air or cal
-                                status[start:end] = prev_val
-                            else:
-                                # Transition between Zero and Cal: split at midpoint
-                                mid = start + (run_len // 2)
-                                status[start:mid] = prev_val
-                                status[mid:end] = next_val
-                        elif prev_val is not None:
-                            # Transient blip at the very end of deployment
-                            status[start:end] = prev_val
-                        elif next_val is not None:
-                            # Startup chatter at the beginning of deployment
-                            status[start:end] = next_val
-                else:
-                    i += 1
-
-            # # Debug
-            # if absorbed_blips > 0:
-                # print(f"Cleaned up {absorbed_blips} transient ambient blip(s) (< {min_ambient_points} points).")
-
-        # --- 7. Backup & State Assignment ---
-        if getattr(self, '_cycling_status', None) is None:
-            self._cycling_status = {}
-        elif 'type' in self._cycling_status and getattr(self, '_original_cycling_status', None) is None:
-            self._original_cycling_status = self._cycling_status['type'].copy()
-
-        self._cycling_status['type'] = status
-        
-        # Ambient acquisition should now have no runs shorter than min_ambient_points
-        self.standard_acquisition_data = (status == 0)
-
-        n_zero_pts = np.sum(status == 1)
-        n_cal_pts = np.sum(status == 4)
-        n_amb_pts = np.sum(status == 0)
-        print(f"Cycling status synthesis found: {n_zero_pts} zero points, {n_cal_pts} cal points, {n_amb_pts} ambient points.")
-
-        # --- 8. Diagnostic Verification Plot ---
-        if plot_flag:
-            from opentof.utils import get_default_plot_dir, ensure_dir
-            if output_dir is None:
-                base_dir = self.plot_dir if getattr(self, 'plot_dir', None) is not None else get_default_plot_dir()
-                output_dir = os.path.join(base_dir, self.default_plot_subdir)
-            ensure_dir(output_dir)
-
-            fig, (ax1, ax2) = plt.subplots(
-                2, 1, 
-                figsize=(12, 6), 
-                sharex=True, 
-                dpi=150, 
-                gridspec_kw={'height_ratios': [1, 2]}
-            )
-
-            # Subplot 1: Cleaned Phase Timeline
-            ax1.plot(self.timestamps, status, color='indigo', lw=1.2)
-            ax1.set_ylabel("Cycle Phase", fontweight='bold')
-            ax1.set_yticks([0, 1, 4])
-            ax1.set_yticklabels(["0 (Ambient)", "1 (Zero)", "4 (Cal)"])
-            ax1.grid(True, alpha=0.3, linestyle="--")
-            ax1.set_title(f"Synthesized Cycling Status")
-
-            # Subplot 2: Physical Flows Supporting the Assignment
-            if zero_flow is not None:
-                ax2.plot(self.timestamps, zero_flow, color='blue', alpha=0.7, label='Zero MFC [sccm]')
-            if cal_flow is not None:
-                ax2_twin = ax2.twinx()
-                ax2_twin.plot(self.timestamps, cal_flow, color='crimson', alpha=0.8, label='Cal MFC [sccm]')
-                ax2_twin.set_ylabel("Cal MFC (sccm)", color='crimson', fontweight='bold')
-                ax2_twin.tick_params(axis='y', labelcolor='crimson')
-
-            ax2.set_ylabel("Zero MFC (sccm)", color='blue', fontweight='bold')
-            ax2.tick_params(axis='y', labelcolor='blue')
-            ax2.set_xlabel("Time (UTC)")
-            ax2.grid(True, alpha=0.3, linestyle="--")
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, plot_filename), bbox_inches='tight')
-            plt.close()
-
-        return self
-
-    def quantify_signal(self, peak_target,
+    def quantify_signal(self, 
+                        peak_target,
                         cal_tank_conc=1000.0,
                         zero_flow=None,
                         cal_flow=None,
@@ -3411,6 +3258,8 @@ class Deployment:
                         min_zero_points=5,
                         min_cal_points=5,
                         min_signal_delta=0.5,
+                        trim_zero_transients=2,
+                        trim_cal_transients=2,
                         plot_flag=False,
                         output_dir=None,
                         plot_subdir="quantification_plots",
@@ -3489,22 +3338,42 @@ class Deployment:
             signal_array = np.asarray(peak_target, dtype=float)
 
         # --- 2. Auto-Detect Flows from TPS2 Telemetry ---
-        # Find Mass Flow Controller (MFC) variables in the telemetry cache via substring matching
+        # 2. Auto-Detect Flows from TPS2 (Prefer monitors over setpoints)
+        if zero_flow is None and hasattr(self, "tps2") and self.tps2:
+            mon_keys = [
+                k
+                for k in self.tps2.keys()
+                if "zero" in k.lower() and "mfc" in k.lower() and "mon" in k.lower()
+            ]
+            all_keys = [
+                k
+                for k in self.tps2.keys()
+                if "zero" in k.lower() and "mfc" in k.lower()
+            ]
+            if mon_keys:
+                zero_flow = self.tps2[mon_keys[0]]
+            elif all_keys:
+                zero_flow = self.tps2[all_keys[0]]
         if zero_flow is None:
-            if hasattr(self, 'tps2') and self.tps2:
-                matched_zero = [k for k in self.tps2.keys() if 'zero' in k.lower() and 'mfc' in k.lower()]
-                if matched_zero:
-                    zero_flow = self.tps2[matched_zero[0]]
-            if zero_flow is None:
-                zero_flow = 250.0  # Fallback default
+            zero_flow = 250.0
 
+        if cal_flow is None and hasattr(self, "tps2") and self.tps2:
+            mon_keys = [
+                k
+                for k in self.tps2.keys()
+                if "cal" in k.lower() and "mfc" in k.lower() and "mon" in k.lower()
+            ]
+            all_keys = [
+                k
+                for k in self.tps2.keys()
+                if "cal" in k.lower() and "mfc" in k.lower()
+            ]
+            if mon_keys:
+                cal_flow = self.tps2[mon_keys[0]]
+            elif all_keys:
+                cal_flow = self.tps2[all_keys[0]]
         if cal_flow is None:
-            if hasattr(self, 'tps2') and self.tps2:
-                matched_cal = [k for k in self.tps2.keys() if 'cal' in k.lower() and 'mfc' in k.lower()]
-                if matched_cal:
-                    cal_flow = self.tps2[matched_cal[0]]
-            if cal_flow is None:
-                cal_flow = 5.0  # Fallback default
+            cal_flow = 5.0
 
         # --- 3. Resolve Normalization Reference ---
         # Allow passing the formula string of the primary reagent ion (e.g., "I-")
@@ -3544,6 +3413,8 @@ class Deployment:
             min_zero_points=min_zero_points,
             min_cal_points=min_cal_points,
             min_signal_delta=min_signal_delta,
+            trim_zero_transients=trim_zero_transients,
+            trim_cal_transients=trim_cal_transients,
             plot_flag=plot_flag,
             output_dir=output_dir,
             plot_subdir=plot_subdir,
@@ -4259,7 +4130,8 @@ class Deployment:
     def nominal_mass_som(self, nm, 
                          som_size=None,
                          output_dir=None, 
-                         plot_subdir=None, 
+                         plot_subdir=None,
+                         plot_flag=True, 
                          **kwargs):
         from opentof.som_helpers import (
             RowMinMaxScaler, build_nm_som, organize_som_data,
@@ -4326,13 +4198,250 @@ class Deployment:
         if getattr(self, 'custom_peak_shape', None) is not None:
             process_som_weight_peaks(nm_node_data, nm, self.peak_width_function, 
                                     peak_type='custom', custom_shape=self.custom_peak_shape,
-                                    output_dir=output_dir, plot_subdir=plot_subdir)
+                                    output_dir=output_dir, plot_subdir=plot_subdir,
+                                    plot_flag=plot_flag)
         else:
             process_som_weight_peaks(nm_node_data, nm, self.peak_width_function,
-                                     output_dir=output_dir, plot_subdir=plot_subdir)
+                                     output_dir=output_dir, plot_subdir=plot_subdir,
+                                     plot_flag=plot_flag)
         
         return nm_node_data, som_err_metrics, som
 
+
+    def populate_nm_soms_quantized(
+        self,
+        nm_list=None,
+        som_size=(5, 5),
+        skip_flat_channels=True,
+        noise_mult=5.0,
+        store_dense_recon=False,
+        verbose=False,
+    ):
+        from opentof.som_helpers import RowMinMaxScaler, build_nm_som
+        from opentof.utils import get_raw_nm_data
+        """
+        Train SOMs across nominal masses in a memory-safe stream, storing only the
+        compact quantized codebook representation on the Deployment object.
+        """
+        if getattr(self, "calibration", None) is None:
+            raise ValueError("Mass calibration not run. Call `calibrate_mass()` first.")
+
+        # Select baseline-subtracted data if available
+        data_source = (
+            self.tofdata_subtracted
+            if getattr(self, "tofdata_subtracted", None) is not None
+            else self.tofdata
+        )
+        mass_axis = (
+            self.reference["rs_mass_axis"]
+            if getattr(self, "reference", None) is not None
+            else self.first_guess_mass_axis
+        )
+
+        # Resolve nominal mass targets
+        if nm_list is None:
+            nm_list = np.unique(np.round(mass_axis)).astype(int)
+            # nm_list = nm_list[(nm_list >= 15) & (nm_list <= 400)]
+
+        global_noise = 0.0
+        if getattr(self, "baseline", None) and "global_noise_level" in self.baseline:
+            global_noise = float(self.baseline["global_noise_level"])
+
+        # Initialize experimental container attributes
+        if not hasattr(self, "nm_soms"):
+            self.nm_soms = {}
+        if not hasattr(self, "nm_som_quantized"):
+            self.nm_som_quantized = {}
+
+        n_spectra = len(data_source)
+        print(f"Streaming SOM quantization across {len(nm_list)} nominal masses...")
+
+        for nm in tqdm(nm_list, desc="Quantizing NM SOMs"):
+            # 1. Memory-safe extraction of single nominal mass window across all spectra
+            int_seg, neg2d_seg, ma_seg, _ = get_raw_nm_data(
+                nm=nm,
+                tofdata=data_source,
+                tof_axis=self.tof_axis,
+                calibration_results=self.calibration,
+                mode="pad",
+                chunk_size=self.chunk_size,
+            )
+
+            L = int_seg.shape[1]
+            if L < 4:
+                continue
+
+            # Fast gatekeeper: skip completely flat / dead baseline windows
+            if (
+                skip_flat_channels
+                and global_noise > 0
+                and np.max(int_seg) <= (global_noise * noise_mult)
+            ):
+                continue
+
+            # 2. Row-wise scaling of intensity, neg2d, and mass coordinates
+            scaler_int = RowMinMaxScaler()
+            int_scaled, int_scalers = scaler_int.fit_transform(int_seg)
+
+            scaler_n2d = RowMinMaxScaler()
+            n2d_scaled, _ = scaler_n2d.fit_transform(neg2d_seg)
+
+            scaler_ma = RowMinMaxScaler()
+            ma_scaled, _ = scaler_ma.fit_transform(ma_seg)
+
+            input_samples = np.concatenate([int_scaled, n2d_scaled, ma_scaled], axis=1)
+
+            # 3. Train MiniSom (5x5)
+            som = build_nm_som(
+                nm=nm,
+                input_samples=input_samples,
+                som_size=som_size,
+                verbose=verbose,
+            )
+
+            # 4. Map samples to winning node indices (BMU)
+            # Winner index (0 to 24 for a 5x5 map) stored as uint8
+            weights_flat = som.get_weights().reshape(-1, input_samples.shape[1])
+            winner_indices = np.argmin(
+                som._distance_from_weights(input_samples), axis=1
+            ).astype(np.uint8)
+
+            # Channel mapping in reference detector array [nm - 0.5, nm + 0.5)
+            ch_start = np.searchsorted(mass_axis, nm - 0.5)
+            ch_end = np.searchsorted(mass_axis, nm + 0.5)
+            channel_indices = np.arange(ch_start, ch_end)
+
+            # 5. Pack compact metadata dictionary
+            nm_meta = {
+                "channel_indices": channel_indices,
+                "int_scalers": int_scalers,  # Shape: (N_spectra, 2)
+                "winner_indices": winner_indices,  # Shape: (N_spectra,)
+                "segment_length": L,
+                "mz_bounds": (nm - 0.5, nm + 0.5),
+            }
+
+            # Optional: cache dense reconstructed intensity if explicitly requested
+            if store_dense_recon:
+                quantized_int_scaled = weights_flat[winner_indices, :L]
+                nm_meta["recon_intensity"] = RowMinMaxScaler.inverse_transform(
+                    quantized_int_scaled, int_scalers
+                )
+
+            self.nm_soms[nm] = som
+            self.nm_som_quantized[nm] = nm_meta
+
+            # Explicitly free raw arrays from memory
+            del int_seg, neg2d_seg, ma_seg, input_samples
+
+        print(
+            f"✅ SOM quantization complete. Stored {len(self.nm_soms)} models in `deployment.nm_soms`."
+        )
+        return self
+
+    def get_som_reconstructed_spectrum(self, ms_i):
+        """
+        Reconstruct a single 1D full spectrum for scan index `ms_i` on-demand
+        by stitching winning SOM prototype shapes across all nominal masses.
+        """
+        from opentof.som_helpers import RowMinMaxScaler
+        if not hasattr(self, "nm_som_quantized") or not self.nm_som_quantized:
+            raise ValueError(
+                "No quantized SOM data found. Call `populate_nm_soms_quantized()` first."
+            )
+
+        num_samples = (
+            len(self.tof_axis)
+            if self.tof_axis is not None
+            else self.tofdata.shape[-1]
+        )
+        reconstructed_spec = np.zeros(num_samples, dtype=np.float32)
+
+        for nm, meta in self.nm_som_quantized.items():
+            som = self.nm_soms[nm]
+            L = meta["segment_length"]
+            weights_flat = som.get_weights().reshape(-1, som._input_len)
+
+            # Retrieve the winning node prototype for this scan
+            win_idx = meta["winner_indices"][ms_i]
+            prototype_scaled_int = weights_flat[win_idx, :L]
+
+            # Re-scale back to original intensity units
+            row_scalers = meta["int_scalers"][ms_i : ms_i + 1, :]
+            recon_seg = RowMinMaxScaler.inverse_transform(
+                prototype_scaled_int[np.newaxis, :], row_scalers
+            ).ravel()
+
+            # Stitch into corresponding channel span
+            ch_idx = meta["channel_indices"]
+            if len(ch_idx) == len(recon_seg):
+                reconstructed_spec[ch_idx] = recon_seg
+            elif len(ch_idx) > 0:
+                # Interpolate if extrapolation slightly shifted segment lengths
+                x_old = np.linspace(0, 1, len(recon_seg))
+                x_new = np.linspace(0, 1, len(ch_idx))
+                reconstructed_spec[ch_idx] = np.interp(x_new, x_old, recon_seg)
+
+        return reconstructed_spec
+
+
+    def stitch_all_som_spectra(self, chunk_size=1000, target_h5_dataset=None):
+        """
+        Stitch reconstructed spectra across all scans. Returns a 2D NumPy array
+        if small enough, or writes directly in chunks to an open HDF5 dataset.
+        """
+        from opentof.som_helpers import RowMinMaxScaler
+        if not hasattr(self, "nm_som_quantized") or not self.nm_som_quantized:
+            raise ValueError(
+                "No quantized SOM data found. Call `populate_nm_soms_quantized()` first."
+            )
+
+        n_spectra = len(next(iter(self.nm_som_quantized.values()))["winner_indices"])
+        num_samples = (
+            len(self.tof_axis)
+            if self.tof_axis is not None
+            else self.tofdata.shape[-1]
+        )
+
+        if target_h5_dataset is None:
+            full_stitched = np.zeros((n_spectra, num_samples), dtype=np.float32)
+
+        # Process scans in blocks to prevent RAM pressure
+        for c_start in range(0, n_spectra, chunk_size):
+            c_end = min(c_start + chunk_size, n_spectra)
+            chunk_block = np.zeros((c_end - c_start, num_samples), dtype=np.float32)
+
+            for nm, meta in self.nm_som_quantized.items():
+                som = self.nm_soms[nm]
+                L = meta["segment_length"]
+                weights_flat = som.get_weights().reshape(-1, som._input_len)
+
+                # Slices for this spectrum chunk
+                chunk_winners = meta["winner_indices"][c_start:c_end]
+                chunk_scalers = meta["int_scalers"][c_start:c_end]
+
+                # Quantized scaled prototype intensity
+                chunk_proto_scaled = weights_flat[chunk_winners, :L]
+                chunk_recon = RowMinMaxScaler.inverse_transform(
+                    chunk_proto_scaled, chunk_scalers
+                )
+
+                ch_idx = meta["channel_indices"]
+                if len(ch_idx) == L:
+                    chunk_block[:, ch_idx] = chunk_recon
+                elif len(ch_idx) > 0:
+                    x_old = np.linspace(0, 1, L)
+                    x_new = np.linspace(0, 1, len(ch_idx))
+                    for local_i in range(chunk_block.shape[0]):
+                        chunk_block[local_i, ch_idx] = np.interp(
+                            x_new, x_old, chunk_recon[local_i]
+                        )
+
+            if target_h5_dataset is not None:
+                target_h5_dataset[c_start:c_end, :] = chunk_block
+            else:
+                full_stitched[c_start:c_end, :] = chunk_block
+
+        return full_stitched if target_h5_dataset is None else target_h5_dataset
 
     def export_to_h5(self, output_dir=None, filename=None, driver="PIF") -> Deployment:
         """
