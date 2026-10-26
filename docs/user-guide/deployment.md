@@ -40,13 +40,13 @@ We can see that our files were read in sucessfully, but lets briefly break down 
 
 2. "Determining Instrument Type" - This is a simple check to determine what sort of instrument we are dealing with. This step looks for the presence of an "Ionization" group within the original `.h5` files, which is used to differentiate files from an instrument with multiple switching reagent ions (like in a VOCUS AIM) vs. an instrument with a single reagent ion (like the VOCUS Eiger at CDPHE). If we accidentally had `.h5` files from both a VOCUS AIM and a VOCUS Eiger in the smme directory an error would be thrown here.
 
-3. "Populating deployment.cycling_status" - This step attemps to parse the real-time cycling data from an instrument if cycling was active during acquisition. It first looks for the presence of a "Cycling_Status" (and/or "Corrections") dataset within the original .h5 files and processes this information to populate `Deployment.cycling_status` and both `Deployment.nonstandard_acquisition_data` and `Deployment.standard_acquisition_data` which are binary masks (and inverses of one another) which can be used to determine periods where calibration gas or zero air are flowing into the instrument. These writebuf aligned variables can be used to filter out certain portions of data for processing. If cycling was not active during acquisition everything is assumed to be "standard" and gets a value of `1` in `Deployment.standard_acquisition_data`.
+3. "Building deployment.tofdata" - Arguably the most critical step of the initialization procedure, this step parses through the "/FullSpectra" dataset within the original `.h5` files and aligns it to our writebuf indexing structure. It will also automatically convert the data into ions/s based on several variables within the original data. It reads all of this data into a `dask` array so that long and/or very high resolution series of measurements do not exceed available RAM. It is this data that will eventually be integrated over to produce our final time-series.
 
-4. "Building deployment.tofdata" - Arguably the most critical step of the initialization procedure, this step parses through the "/FullSpectra" dataset within the original `.h5` files and aligns it to our writebuf indexing structure. It will also automatically convert the data into ions/s based on several variables within the original data. It reads all of this data into a `dask` array so that long and/or very high resolution series of measurements do not exceed available RAM. It is this data that will eventually be integrated over to produce our final time-series.
+4. "Calculating deployment.first_guess_mass_axis" - This step calculates a "first guess mass axis" using the attributes contained within the "/FullSpectra" dataset from the original `.h5`. It is important to note here that sometimes the instrument calibration may be misaligned. If you notice nonsensical results when performing a mass calibration or plotting spectra (for example the max m/z is off) see the methods for fixing this calibration: `Deployment.fix_external_calibration` and `Deployment.auto_fix_external_calibration`. The "first guess mass axis" is mainly used within the mass calibration as an initial guess at calibrant positions in m/z space.
 
-5. "Calculating deployment.first_guess_mass_axis" - This step calculates a "first guess mass axis" using the attributes contained within the "/FullSpectra" dataset from the original `.h5`. It is important to note here that sometimes the instrument calibration may be misaligned. If you notice nonsensical results when performing a mass calibration or plotting spectra (for example the max m/z is off) see the methods for fixing this calibration: `Deployment.fix_external_calibration` and `Deployment.auto_fix_external_calibration`. The "first guess mass axis" is mainly used within the mass calibration as an initial guess at calibrant positions in m/z space.
+5. "Enforcing global chronological order" - This step simply checks whether the `Deployment.timestamps` array is sorted by increasing time, and if not triggers a sort that reindexes writebufs (and associated variables aligned with writebufs) in a way that achieves this. Note: Enforcing chronological order here guarantees that time-series telemetry (like MFC flows) aligns with the spectral data in the next step.
 
-6. "Enforcing global chronological order" - This step simply checks whether the `Deployment.timestamps` array is sorted by increasing time, and if not triggers a sort that reindexes writebufs (and associated variables aligned with writebufs) in a way that achieves this.
+6. "Building deployment.cycling_status" - This step determines the active instrument cycling state (Ambient, Auto-Zero, or Sensitivity Calibration) by establishing a hierarchy of ground truth. Rather than blindly trusting the scheduled DAQ sequence, OpenTof first looks at the physical telemetry (Mass Flow Controllers and solenoid valve states in Deployment.tps2) to determine exactly when zero air or calibration gas was actually flowing into the instrument. If physical telemetry is unavailable, it falls back to the programmed DAQ tables ("Cycling_Status" or "Corrections").
 
 Now that we know roughly what happens at the time of initialization, lets explore some key attributes of the Deployment object that can help us understand it's contents!
 
@@ -973,58 +973,6 @@ dict_keys(['unconstrained_121'])
 dict_keys(['nominal_mass', 'mz_segment', 'int_segment', 'total_fit', 'peaks', 'fit_params'])
 """
 ```
-
-### Deployment.synthesize_cycling_status
-
-We can't actually use our demo data to demonstrate this function as this function isn't needed for these datafiles. However, for out next wrapper function (`Deployment.quantify_signal`) it is important to have any instrument cycling defined over the acquisition period. Therefore it is the job of `synthesize_cycling_status` to imply any underlying cycling table from the instrument telemetry (opening/closing of cal/zero valves) and associate that with a flow value at that particular time. 
-
-It can be called similarly to our other high-level functions:
-
-```python
-d.synthesize_cycling_status()
-```
-![sythesize_cycling_status](../assets/images/deployment_md/deployment_synthesize_cycling_status_final.png)
-
-OpenTof normally looks for zero/cal values states at the following TPS2 variables:
-
-```python
-for key, val in d.tps2.items():
-    print(f"{key}: {val}")
-# Output
-"""
-...
-Zero MFC monitor [sccm]: [249.954  249.9596 249.9596 ... 249.7226 249.7226 249.7226]
-Zero MFC target [sccm]: [250. 250. 250. ... 250. 250. 250.]
-Cal MFC monitor [sccm]: [5.007092 5.007092 5.006758 ... 4.991564 4.991564 5.002224]
-Cal MFC target [sccm]: [4.9998 4.9998 4.9998 ... 4.9998 4.9998 4.9998]
-...
-GSU_VALVE_PR1 target []: [1. 1. 1. ... 0. 0. 0.]
-GSU_VALVE_PR1 monitor []: [0. 0. 1. ... 0. 0. 0.]
-GSU_VALVE_PR2 target []: [0. 0. 0. ... 0. 0. 0.]
-GSU_VALVE_PR2 monitor []: [0. 0. 0. ... 0. 0. 0.]
-...
-"""
-```
-
-Before and after this function for a specific stretch of acquisition may look something like this:
-
-```python
-# plotting code:
-plt.figure(figsize=(12,6))
-plt.plot(d.timestamps, d.cycling_status['type']) # blue
-plt.plot(d.timestamps, d.standard_acquisition_data, alpha=0.5) # orange
-plt.title("Cycling Information")
-plt.xlabel("Time")
-plt.ylabel("Cycle Phase (catagorical)")
-plt.grid(True, alpha=0.3, linestyle="--")
-plt.show()
-```
-
-Before:
-![incomplete_cycling_table](../assets/images/deployment_md/deployment_synthesize_cycling_status_before.png)
-
-After:
-![properly-defined_cycling_table](../assets/images/deployment_md/deployment_synthesize_cycling_status_after.png)
 
 ### Deployment.quantify_signal
 
