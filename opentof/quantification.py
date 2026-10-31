@@ -731,7 +731,7 @@ def quantify_signal(peak_area_array, cycling_dict=None,
     min_cal_points : int, default=6
         Minimum valid sample points required to accept a calibration challenge block.
     trim_zero_transients : int, default=2
-        Number of leading points to discard from each zero block to allow inlet lines to flush.
+        Number of leading points to discard from each zero block to account for transient flow artifacts
     trim_cal_transients : int, default=2
         Number of leading points to discard from the challenge step while the signal rises.
     min_signal_delta : float, default=1.0

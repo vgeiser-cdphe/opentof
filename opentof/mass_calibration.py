@@ -730,7 +730,7 @@ def run_mass_calibration(tofdata,
                 si_axis = np.arange(idx_min, idx_max)
 
                 # Normalize local peak segment intensity
-                intensity_max = np.max(intensityaxis)
+                intensity_max = np.nanmax(intensityaxis)
                 if intensity_max == 0: 
                     continue
                 norm_intensity = intensityaxis / intensity_max
@@ -762,6 +762,10 @@ def run_mass_calibration(tofdata,
                 calibrant_mz_values = np.array([calibrant_info[c]["m/Q"] for c in interval_active_cals])
 
                 if len(measured_sip) < calculated_min_calibrants:
+                    print(f"measured_sip is: {measured_sip}")
+                    print(f"calculated_min_calibrants is: {calculated_min_calibrants}")
+                    print(f"[WARNING]: Num calibrants reached minimum necessary for computation.")
+                    # params = None
                     break
 
                 # Fit mass calibration function coefficients for current time interval
@@ -796,10 +800,10 @@ def run_mass_calibration(tofdata,
                 else:
                     break
             
-            try:
-                batch_params.append(params)
-            except UnboundLocalError:
-                raise UnboundLocalError("Number of calibrants must be 2 + number of mass calibration parameters")
+            # try:
+            batch_params.append(params)
+            # except UnboundLocalError:
+            #     raise UnboundLocalError("Number of calibrants must be 2 + number of mass calibration parameters")
 
             # Track sample index position (SIP) drift over time
             if track_sip_drift:
@@ -812,7 +816,7 @@ def run_mass_calibration(tofdata,
                         batch_individual_drifts[comp].append(current_sip - reference_lock_sips[comp])
                     else:
                         batch_individual_drifts[comp].append(np.nan)
-            
+
             # Store reconstructed mass axis
             batch_massaxes.append(mass_axis)
 
@@ -1721,14 +1725,14 @@ def reference_spectrum_window(timestamps,
                               ppm_deviation, 
                               window_seconds=600, 
                               methods_weights_dict={'std': 0.4, 'zero': 0.6},
-                              min_fraction=0.9):
+                              min_fraction=0.9,
+                              local_sip_dep_series=None):
     """
     Identify the optimal time window for defining a representative reference spectrum.
 
     Evaluates rolling time windows across a mass accuracy time-series according to user-defined 
-    stability and closeness metrics (e.g., standard deviation, deviation from zero, MAD). 
-    Normalizes and ranks each rolling window metric, calculating a weighted composite rank score 
-    to select the most representative, stable acquisition window.
+    stability and closeness metrics. Supports 'sip_dep' evaluating local (step-wise) calibrant
+    SIP departure to penalize intervals experiencing calibration fitting skew or artifacts.
 
     Parameters
     ----------
@@ -1741,39 +1745,20 @@ def reference_spectrum_window(timestamps,
     methods_weights_dict : dict, default={'std': 0.4, 'zero': 0.6}
         Dictionary mapping evaluation metric keys to relative weightings.
         Supported keys:
-        
-        * ``'std'``: Rolling standard deviation (measures window stability).
-        * ``'var'``: Rolling variance.
-        * ``'range'``: Peak-to-peak span (max - min).
-        * ``'mad'``: Median Absolute Deviation (robust variance).
-        * ``'zero'``: Absolute value of rolling mean (closeness to zero PPM error).
-        * ``'median'``: Absolute distance between rolling mean and global median.
+          - 'std': Rolling standard deviation (measures window stability).
+          - 'var': Rolling variance.
+          - 'range': Peak-to-peak span (max - min).
+          - 'mad': Median Absolute Deviation.
+          - 'zero': Absolute value of rolling mean (closeness to zero PPM error).
+          - 'median': Absolute distance between rolling mean and global median.
+          - 'sip_dep': Rolling mean of local step-wise SIP departure (optimizes for lower dispersion).
     min_fraction : float, default=0.9
-        Minimum required fraction of valid data points inside a rolling window 
-        to be eligible for selection.
-
-    Returns
-    -------
-    mask : numpy.ndarray of bool
-        1D boolean array aligned with the original input timestamps array, 
-        where ``True`` marks writebufs falling within the chosen reference window.
-    best_start : pandas.Timestamp
-        Timestamp marking the start of the selected optimal window.
-    best_end : pandas.Timestamp
-        Timestamp marking the end of the selected optimal window.
-    best_metrics : dict
-        Dictionary containing raw metric values and the final composite rank score 
-        evaluated at the optimal window location.
-
-    Raises
-    ------
-    ValueError
-        If no rolling window meets the minimum valid data fraction constraint or 
-        if an unrecognized metric method key is supplied in `methods_weights_dict`.
+        Minimum required fraction of valid data points inside a rolling window.
+    local_sip_dep_series : numpy.ndarray or pandas.Series or None, default=None
+        1D writebuf-aligned series of instantaneous/local calibrant SIP departure.
     """
-    # Verify and notify if user-provided method weights do not sum to 1.0
     total_weight = sum(methods_weights_dict.values())
-    if not np.isclose(total_weight, 1.0):
+    if not np.isclose(total_weight, 1.0) and total_weight > 0:
         print(f"NOTE: Weights sum to {total_weight:.2f}. "
               f"Normalizing automatically to 1.0 for score calculation.")
 
@@ -1783,6 +1768,12 @@ def reference_spectrum_window(timestamps,
     ts_sorted = timestamps[sort_idx]
     ppm_sorted = ppm_deviation[sort_idx]
     ts = pd.Series(ppm_sorted, index=ts_sorted)
+
+    # Align local SIP departure series if provided
+    sip_dep_sorted = None
+    if local_sip_dep_series is not None:
+        sip_dep_arr = np.asarray(local_sip_dep_series, dtype=float)
+        sip_dep_sorted = pd.Series(sip_dep_arr[sort_idx], index=ts_sorted)
 
     # Determine data completeness inside rolling time windows
     valid_counts = ts.rolling(f"{window_seconds}s").count()
@@ -1794,66 +1785,61 @@ def reference_spectrum_window(timestamps,
     raw_metrics = {}
     ranked_metrics = {}
 
-    # Evaluate each requested stability / accuracy metric over rolling time windows
     for method in methods_weights_dict.keys():
         if method == "std":
-            # Measure standard deviation (stability) within window
             metric_series = ts.rolling(f"{window_seconds}s").std()
         elif method == "var":
-            # Measure rolling variance within window
             metric_series = ts.rolling(f"{window_seconds}s").var()
         elif method == "range":
-            # Measure peak-to-peak span (max - min) within window
             metric_series = ts.rolling(f"{window_seconds}s").apply(
                 lambda x: np.nanmax(x) - np.nanmin(x), raw=True
             )
         elif method == "mad":
-            # Measure Median Absolute Deviation within window
             metric_series = ts.rolling(f"{window_seconds}s").apply(
                 lambda x: np.nanmedian(np.abs(x - np.nanmedian(x))), raw=True
             )
         elif method == "zero":
-            # Measure closeness of window rolling mean to zero PPM error
             rolling_mean = ts.rolling(f"{window_seconds}s").mean()
             metric_series = rolling_mean.abs()
         elif method == "median":
-            # Measure closeness of window rolling mean to global median PPM error
             med = np.nanmedian(ppm_deviation)
             rolling_mean = ts.rolling(f"{window_seconds}s").mean()
             metric_series = (rolling_mean - med).abs()
+        elif method == "sip_dep":
+            if sip_dep_sorted is None:
+                raise ValueError("Method 'sip_dep' requested in methods_weights_dict, "
+                                 "but local_sip_dep_series was not provided.")
+            # Rolling mean of local departure (optimizing for lowest departure)
+            metric_series = sip_dep_sorted.rolling(f"{window_seconds}s").mean()
         else:
             raise ValueError(f"Unknown method '{method}'")
 
-        # Mask out windows failing min_fraction data coverage requirements
         metric_series = metric_series.where(valid_mask, np.nan)
         raw_metrics[method] = metric_series
-        
-        # Rank valid windows via percentile ranking (0.0 = best/lowest error, 1.0 = worst)
+        # Percentile rank: lower is better (0.0 = best, 1.0 = worst)
         ranked_metrics[method] = metric_series.rank(pct=True, ascending=True)
 
-    # Compute weighted composite score across all evaluated metrics
+    # Compute weighted composite rank score
     combined_score = pd.Series(0.0, index=ts.index)
-    total_weight = sum(methods_weights_dict.values())
-    
-    for method, weight in methods_weights_dict.items():
-        combined_score += (ranked_metrics[method].fillna(1.0) * weight)
+    if total_weight > 0:
+        for method, weight in methods_weights_dict.items():
+            combined_score += (ranked_metrics[method].fillna(1.0) * weight)
+        combined_score = combined_score / total_weight
+    else:
+        combined_score = ts.rolling(f"{window_seconds}s").std().rank(pct=True, ascending=True)
 
-    combined_score = combined_score / total_weight
+    eligible_scores = combined_score.where(valid_mask, np.nan)
+    best_idx = eligible_scores.idxmin()
 
-    # Identify timestamp corresponding to the lowest combined rank score
-    best_idx = combined_score.idxmin()
     if pd.isna(best_idx):
-        raise ValueError("No valid window found that meets min_fraction requirement.")
+        raise ValueError("No valid window found that meets min_fraction requirements.")
 
-    # Extract raw metric values and final score for winning window
-    best_metrics = {m: raw_metrics[m].loc[best_idx] for m in methods_weights_dict.keys()}
+    best_metrics = {m: raw_metrics[m].loc[best_idx] for m in raw_metrics.keys()}
     best_metrics['combined_score'] = combined_score.loc[best_idx]
 
-    # Calculate start and end boundaries for the optimal window
     best_start = best_idx - pd.Timedelta(seconds=window_seconds)
     best_end = best_idx
 
-    # Build boolean selection mask matching original unsorted input array layout
     mask_sorted = (ts.index >= best_start) & (ts.index <= best_end)
     mask = np.zeros_like(mask_sorted, dtype=bool)
     mask[sort_idx] = mask_sorted
@@ -1866,7 +1852,7 @@ def define_reference_spectrum(calibration_results,
                               timestamps,
                               reference_peak_mass=None,
                               window_seconds=600,                  
-                              methods_weights_dict={'std': 0.4, 'zero': 0.6},
+                              methods_weights_dict={'std': 0.35, 'zero': 0.40, 'sip_dep': 0.25},
                               min_fraction=0.9,
                               peak_type='gaussian',
                               custom_shape=None,
@@ -1884,7 +1870,8 @@ def define_reference_spectrum(calibration_results,
                               plt_y_max=1,
                               plt_y_min=-0.05,
                               chunk_size=1000,
-                              max_iter=100):
+                              max_iter=100,
+                              ):
     """
     Identifies an 'optimal' time window and computes a high-quality reference mass spectrum.
 
@@ -2134,13 +2121,66 @@ def define_reference_spectrum(calibration_results,
 
     # --- STEP 3: Reference Window Selection ---
     if (cursor_starttime is None) and (cursor_endtime is None):
-        # Automatically determine optimal reference window via stability ranking
+        local_sip_dep_series = None
+        
+        # 1. Compute local (interval-to-interval) SIP departure
+        # Case A: Derived directly from per-calibrant measured SIPs (most accurate)
+        if "batch_measured_sip" in calibration_results and calibration_results["batch_measured_sip"] is not None:
+            sips_arr = np.asarray(calibration_results["batch_measured_sip"], dtype=float)  # (N_intervals, N_cals)
+            
+            if sips_arr.ndim == 2 and sips_arr.shape[0] > 1:
+                # Interval-to-interval step for each calibrant: ΔSIP_c[k] = SIP_c[k] - SIP_c[k-1]
+                delta_sips = np.diff(sips_arr, axis=0)  # Shape: (N_intervals - 1, N_cals)
+                
+                # Common-mode translation across all calibrants in interval k
+                step_common_median = np.nanmedian(delta_sips, axis=1, keepdims=True)
+                
+                # Deviation from common-mode step: how much did individual calibrants scatter/pull apart?
+                calibrant_step_residuals = np.abs(delta_sips - step_common_median)
+                
+                # Robust dispersion across calibrants for interval k (MAD)
+                step_departure = np.nanmedian(calibrant_step_residuals, axis=1)
+                
+                # Pad interval 0 with the value of interval 1 so array length matches total intervals
+                local_interval_departure = np.concatenate([[step_departure[0]], step_departure])
+            else:
+                local_interval_departure = None
+
+        # Case B: Fallback from average_sip_drift and median_sip_drift
+        elif ("average_sip_drift" in calibration_results and 
+              "median_sip_drift" in calibration_results and 
+              calibration_results["average_sip_drift"] is not None and 
+              calibration_results["median_sip_drift"] is not None):
+            
+            avg_drift = np.asarray(calibration_results["average_sip_drift"], dtype=float)
+            med_drift = np.asarray(calibration_results["median_sip_drift"], dtype=float)
+            
+            if len(avg_drift) > 1:
+                d_avg = np.diff(avg_drift)
+                d_med = np.diff(med_drift)
+                step_departure = np.abs(d_avg - d_med)
+                local_interval_departure = np.concatenate([[step_departure[0]], step_departure])
+            else:
+                local_interval_departure = None
+        else:
+            local_interval_departure = None
+
+        # 2. Map interval departure to each writebuf via interval_indices
+        if local_interval_departure is not None:
+            valid_interval_idx = interval_indicies.astype(int)
+            local_sip_dep_series = np.full(len(valid_interval_idx), np.nan, dtype=float)
+            
+            valid_mask_idx = (valid_interval_idx >= 0) & (valid_interval_idx < len(local_interval_departure))
+            local_sip_dep_series[valid_mask_idx] = local_interval_departure[valid_interval_idx[valid_mask_idx]]
+
+        # 3. Select optimal reference window
         rs_mask, start, end, metrics_dict = reference_spectrum_window(
             timestamps, 
             ppm_positional_offset_np, 
             window_seconds=window_seconds,
             methods_weights_dict=methods_weights_dict,
             min_fraction=min_fraction,
+            local_sip_dep_series=local_sip_dep_series,
         )
 
         print()

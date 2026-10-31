@@ -128,6 +128,7 @@ class Deployment:
         # State flags and corruption tracking masks
         self._user_entered_cycling_flag = False
         self._corrupt_flags = None  # Tracks corrupted writebuf masks across all loaded files
+        self._zero_spectra_flags = None # Tracks writebufs where tofdata is zero everywhere (generally causes problems...)
 
         # Global chronological sorting index and cached timestamp array
         self._global_sort_idx = None
@@ -166,6 +167,9 @@ class Deployment:
         self.time_series = None
 
         self.apd_df = None
+
+        # Container for physical telemetry-derived cycling flags used in quantification
+        self._quantification_flags = None
 
         # Block chunk size for parallel Dask matrix evaluations
         self.chunk_size = chunk_size
@@ -365,6 +369,7 @@ class Deployment:
         # Step 3: Construct out-of-core Dask TOF array
         print("Step 3/6: Building deployment.tofdata")
         obj.build_tofdata()
+        obj.check_zero_spectra()
 
         # Step 4: Compute initial first-guess mass axis
         print("Step 4/6: Calculating deployment.first_guess_mass_axis")
@@ -426,6 +431,7 @@ class Deployment:
         obj : Deployment
             Fully initialized `Deployment` instance for the single file.
         """
+        print("Step 1/6: Loading .h5 file")
         # Parse single HDF5 file metadata and timestamps
         h5, timestamps, shape, sort_idx = cls._load_and_parse_h5(filepath, 0)
         
@@ -437,10 +443,26 @@ class Deployment:
         obj = cls({0: h5}, {0: timestamps}, {0: shape}, {0: sort_idx}, target_nbr_samples, chunk_size, segment_profiles, reagent_ion, plot_dir=plot_dir)
 
         # Run standard initialization pipeline steps
+        # Step 2: Determine single-segment or multi-segment instrument type
+        print("Step 2/6: Determining Instrument Type")
         obj.get_instrument_type()
-        obj.build_cycling_status()
+
+        # Step 3: Construct out-of-core Dask TOF array
+        print("Step 3/6: Building deployment.tofdata")
         obj.build_tofdata()
+        obj.check_zero_spectra()
+
+        # Step 4: Compute initial first-guess mass axis
+        print("Step 4/6: Calculating deployment.first_guess_mass_axis")
         obj.get_first_guess()
+
+        # Step 5: Enforce global chronological timestamp order across files
+        print("Step 5/6: Enforcing global chronological order")
+        obj.enforce_global_time_sort()
+
+        # Step 6: Populate cycling status flags
+        print("Step 6/6: Populating deployment.cycling_status")
+        obj.build_cycling_status()
 
         # Auto-seek and import matching Tofware processing files in adjacent or subfolder paths
         try:
@@ -596,6 +618,17 @@ class Deployment:
         return self._cycling_status
 
     @property
+    def quantification_flags(self):
+        """
+        Return the physical telemetry-derived cycling status dictionary.
+        
+        Falls back to self.cycling_status if physical telemetry was not derived.
+        """
+        if getattr(self, '_quantification_flags', None) is not None:
+            return self._quantification_flags
+        return self.cycling_status
+
+    @property
     def tofdata(self):
         """
         Return the master time-of-flight spectral data matrix.
@@ -714,7 +747,8 @@ class Deployment:
     @property
     def nonstandard_acquisition_data(self):
         """
-        Return a boolean mask isolating non-standard acquisition scans (zeros, calibrations, corrupt scans).
+        Return a boolean mask isolating non-standard acquisition scans 
+        (zeros, calibrations, corrupt scans, all-zero scans, transients).
         """
         # 1. Genuine manual override takes precedence
         if getattr(self, '_user_entered_cycling_flag', False):
@@ -723,7 +757,7 @@ class Deployment:
             # 2. Dynamic evaluation from cycling ground truth
             type_arr = self.cycling_status.get('type', None)
             if type_arr is not None:
-                # Ambient is 0; Auto-Zero (1), Sensitivity Cal (4), and startup (-1) are non-standard
+                # Ambient is 0; Auto-Zero (1), Sensitivity Cal (4), and startup/transient (-1) are non-standard
                 flags = (type_arr != 0)
             else:
                 length = self.tofdata.shape[0] if self.tofdata is not None else 0
@@ -732,6 +766,10 @@ class Deployment:
         # 3. Always include physically corrupted writebufs
         if getattr(self, '_corrupt_flags', None) is not None and len(self._corrupt_flags) == len(flags):
             flags = flags | self._corrupt_flags
+
+        # 4. Always include all-zero spectra
+        if getattr(self, '_zero_spectra_flags', None) is not None and len(self._zero_spectra_flags) == len(flags):
+            flags = flags | self._zero_spectra_flags
 
         return flags
 
@@ -845,23 +883,58 @@ class Deployment:
             
         return self._cache[group_name]
 
+    def check_zero_spectra(self) -> np.ndarray:
+        """
+        Identify spectra where all TOF sample channels are zero (e.g., dropped writes,
+        shutter closures, or unpopulated disk buffers).
+
+        Evaluates out-of-core across Dask chunks and stores the resulting 1D boolean
+        mask in `self._zero_spectra_flags`.
+
+        Returns
+        -------
+        numpy.ndarray of bool
+            1D boolean array where True indicates an all-zero spectrum.
+        """
+        if getattr(self, '_tofdata', None) is None:
+            self._zero_spectra_flags = np.array([], dtype=bool)
+            return self._zero_spectra_flags
+
+        # (tofdata != 0).any(axis=1) reduces each chunk along the channel axis (axis 1)
+        # in Dask; taking the inverse yields True for all-zero rows.
+        nonzero_mask = (self._tofdata != 0).any(axis=1)
+        if hasattr(nonzero_mask, 'compute'):
+            nonzero_mask = nonzero_mask.compute()
+
+        self._zero_spectra_flags = ~np.asarray(nonzero_mask, dtype=bool)
+
+        n_zeros = int(np.sum(self._zero_spectra_flags))
+        if n_zeros > 0:
+            print(f"WARNING: Identified {n_zeros} all-zero spectra. Flagged as True in Deployment.nonstandard_acquisition_data.")
+
+        return self._zero_spectra_flags
 
     def build_cycling_status(self,
-                         prefer_physical_telemetry=True,
-                         zero_mfc_thresh=50.0,
-                         cal_mfc_thresh=1.0,
-                         min_ambient_points=5,
-                         mismatch_tolerance=0.10,
-                         plot_flag=False,
-                         output_dir=None,
-                         plot_filename="cycling_status.png"):
+                             prefer_physical_telemetry=True,
+                             zero_mfc_thresh=50.0,
+                             cal_mfc_thresh=1.0,
+                             min_segment_points=5,
+                             transient_buffer_points=2,
+                             mismatch_tolerance=0.10,
+                             ):
         """
-        Build unified instrument cycling status, prioritizing physical flows and valves as ground truth.
+        Build instrument cycling status tables.
+        
+        Populates:
+          - self._cycling_status: Clean scheduled/DAQ cycling table for spectral filtering,
+            reference spectra determination, and baseline evaluation.
+          - self._quantification_flags: Physical telemetry-derived cycling states based on
+            MFC flows and valve sensors, used in signal quantification.
         """
         n_spectra = len(self.timestamps)
         
         # -------------------------------------------------------------
-        # 1. Extract Programmed Table & Legacy Corrections
+        # 1. Extract Programmed Table & Legacy Corrections (Scheduled Truth)
         # -------------------------------------------------------------
         combined = {}
         self.extract_cycling_flags()
@@ -899,6 +972,11 @@ class Deployment:
         table_status = self._cycling_status.get('type', np.full(n_spectra, -1)).copy()
         has_table_cycling = np.any(np.isin(table_status, [1, 4]))
 
+        # Ensure scheduled table has valid 0 fallback if all entries are -1
+        if not has_table_cycling and (table_status == -1).all():
+            self._cycling_status['type'] = np.zeros(n_spectra, dtype=np.int32)
+            table_status = self._cycling_status['type']
+
         # -------------------------------------------------------------
         # 2. Derive Physical Truth from Valves & MFC Telemetry
         # -------------------------------------------------------------
@@ -907,96 +985,130 @@ class Deployment:
         has_mfc = has_tps2 and any('mfc' in k.lower() for k in self.tps2.keys())
         can_derive_physical = prefer_physical_telemetry and (has_valves or has_mfc)
 
+        physical_status = None
+
         if can_derive_physical:
-            # Extract MFC flows
-            zero_flow, cal_flow = None, None
-            for k, v in self.tps2.items():
-                kl = k.lower()
-                if 'mfc' in kl:
-                    if 'zero' in kl and zero_flow is None:
-                        zero_flow = np.asarray(v, dtype=float)
-                    elif 'cal' in kl and cal_flow is None:
-                        cal_flow = np.asarray(v, dtype=float)
+            try:
+                # Helper to check if array contains valid numeric data
+                def is_valid_array(arr):
+                    if arr is None or len(arr) != n_spectra:
+                        return False
+                    return not np.all(np.isnan(arr))
 
-            # Extract Valve States
-            cal_valve, zero_valve = None, None
-            for k, v in self.tps2.items():
-                kl = k.lower()
-                if 'valve' in kl:
-                    is_open = (np.asarray(v) == 1)
-                    if 'pr1' in kl or 'cal' in kl:
-                        cal_valve = is_open if cal_valve is None else (cal_valve | is_open)
-                    elif 'pr2' in kl or 'zero' in kl:
-                        zero_valve = is_open if zero_valve is None else (zero_valve | is_open)
+                # --- Extract MFC flows ---
+                zero_flow, cal_flow = None, None
+                for k, v in self.tps2.items():
+                    kl = k.lower()
+                    if 'mfc' in kl:
+                        if 'zero' in kl and is_valid_array(v):
+                            # Prefer monitor over setpoint/target if available
+                            if zero_flow is None or 'mon' in kl:
+                                zero_flow = np.asarray(v, dtype=float)
+                        elif 'cal' in kl and is_valid_array(v):
+                            if cal_flow is None or 'mon' in kl:
+                                cal_flow = np.asarray(v, dtype=float)
 
-            # Establish Flow Thresholds
-            zero_flowing = (zero_flow > zero_mfc_thresh) if (zero_flow is not None and len(zero_flow) == n_spectra) else True
-            cal_flowing = (cal_flow > cal_mfc_thresh) if (cal_flow is not None and len(cal_flow) == n_spectra) else True
+                # Clean NaNs in flows if partially present
+                if zero_flow is not None:
+                    zero_flow = np.nan_to_num(zero_flow, nan=0.0)
+                if cal_flow is not None:
+                    cal_flow = np.nan_to_num(cal_flow, nan=0.0)
 
-            # Phase 4 (Cal Challenge): Cal valve open & cal gas flowing
-            is_cal = (cal_valve & cal_flowing) if cal_valve is not None else (cal_flowing if cal_flow is not None else np.zeros(n_spectra, bool))
-            
-            # Phase 1 (Auto-Zero Air): Zero valve open & zero air flowing (Cal OFF)
-            is_zero = ((zero_valve & zero_flowing) & ~is_cal) if zero_valve is not None else ((zero_flowing & ~is_cal) if zero_flow is not None else np.zeros(n_spectra, bool))
+                # --- Extract Valve States (Guard against all-NaN arrays) ---
+                cal_valve, zero_valve = None, None
+                for k, v in self.tps2.items():
+                    kl = k.lower()
+                    if 'valve' in kl and is_valid_array(v):
+                        arr_v = np.asarray(v, dtype=float)
+                        is_open = (arr_v == 1)
+                        if 'pr1' in kl or 'cal' in kl:
+                            cal_valve = is_open if cal_valve is None else (cal_valve | is_open)
+                        elif 'pr2' in kl or 'zero' in kl:
+                            zero_valve = is_open if zero_valve is None else (zero_valve | is_open)
 
-            physical_status = np.zeros(n_spectra, dtype=np.int32)
-            physical_status[is_zero] = 1
-            physical_status[is_cal] = 4
+                # Derive valve state from MFC flow when valve arrays are all-NaN or missing
+                if cal_valve is None and cal_flow is not None:
+                    cal_valve = (cal_flow > cal_mfc_thresh)
+                if zero_valve is None and zero_flow is not None:
+                    zero_valve = (zero_flow > zero_mfc_thresh)
 
-            # Run-length filter: eliminate transient valve chatter / dropouts
-            if min_ambient_points > 1:
-                i = 0
-                while i < n_spectra:
-                    if physical_status[i] == 0:
+                # Flow Threshold Conditions
+                zero_flowing = (zero_flow > zero_mfc_thresh) if zero_flow is not None else True
+                cal_flowing = (cal_flow > cal_mfc_thresh) if cal_flow is not None else True
+
+                # Phase 4 (Cal Challenge): Cal valve open & cal gas flowing
+                if cal_valve is not None:
+                    is_cal = cal_valve & cal_flowing
+                elif cal_flow is not None:
+                    is_cal = cal_flowing
+                else:
+                    is_cal = np.zeros(n_spectra, dtype=bool)
+
+                # Phase 1 (Auto-Zero Air): Zero valve open & zero air flowing (Cal OFF)
+                if zero_valve is not None:
+                    is_zero = (zero_valve & zero_flowing) & ~is_cal
+                elif zero_flow is not None:
+                    is_zero = zero_flowing & ~is_cal
+                else:
+                    is_zero = np.zeros(n_spectra, dtype=bool)
+
+                # Ensure at least one physical condition was detected
+                if not np.any(is_zero) and not np.any(is_cal) and has_table_cycling:
+                    print("⚠️ Notice: Physical telemetry derived zero active events. Falling back to scheduled table.")
+                    physical_status = table_status.copy()
+                else:
+                    physical_status = np.zeros(n_spectra, dtype=np.int32)
+                    physical_status[is_zero] = 1
+                    physical_status[is_cal] = 4
+
+                    # Digital telemetry dropout smoothing (bridge 1-sample spikes)
+                    for j in range(1, n_spectra - 1):
+                        if physical_status[j] != physical_status[j - 1] and physical_status[j - 1] == physical_status[j + 1]:
+                            physical_status[j] = physical_status[j - 1]
+
+                    # Filter short transients (< min_segment_points)
+                    i = 0
+                    while i < n_spectra:
                         start = i
-                        while i < n_spectra and physical_status[i] == 0:
+                        val = physical_status[i]
+                        while i < n_spectra and physical_status[i] == val:
                             i += 1
                         run_len = i - start
-                        if run_len < min_ambient_points:
-                            prev_val = physical_status[start - 1] if start > 0 else None
-                            next_val = physical_status[i] if i < n_spectra else None
-                            if prev_val == next_val and prev_val is not None:
-                                physical_status[start:i] = prev_val
-                            elif prev_val is not None and next_val is not None:
-                                mid = start + (run_len // 2)
-                                physical_status[start:mid] = prev_val
-                                physical_status[mid:i] = next_val
-                    else:
-                        i += 1
+                        if run_len < min_segment_points and val in (1, 4):
+                            physical_status[start:i] = -1
 
-            # Audit against scheduled table if one was present
-            discrepancy_log = []
-            if has_table_cycling:
-                from opentof.quantification import _locate_index_chunks
-                self._original_cycling_status = table_status.copy()
-                for phase_id, phase_name in [(1, "Auto-Zero"), (4, "Sensitivity Cal")]:
-                    prog_indices = np.where(table_status == phase_id)[0]
-                    if len(prog_indices) == 0:
-                        continue
-                    for chunk in _locate_index_chunks(prog_indices, gap_tol=5, min_chunk_size=1):
-                        start_i, end_i = chunk[0], chunk[-1] + 1
-                        agreement = np.sum(physical_status[start_i:end_i] == phase_id) / (end_i - start_i)
-                        if (1.0 - agreement) > mismatch_tolerance:
-                            discrepancy_log.append({
-                                'phase': phase_name, 'start': start_i, 'end': end_i,
-                                'agreement': agreement, 'reason': 'Valve stuck closed or flow missing'
-                            })
-                self.cycling_reconciliation_log = discrepancy_log
-
-            final_status = physical_status
+            except Exception as e:
+                print(f"⚠️ Warning: Physical telemetry derivation encountered an error: {e}. Falling back to scheduled table.")
+                physical_status = table_status.copy()
         else:
-            # Fallback to DAQ table
-            final_status = table_status
-            if not has_table_cycling:
-                final_status = np.zeros(n_spectra, dtype=np.int32)
+            physical_status = table_status.copy()
 
-        # -------------------------------------------------------------
-        # 3. Direct State Assignment (No Setter Invocation)
-        # -------------------------------------------------------------
-        self._cycling_status['type'] = final_status
+        # Audit physical vs scheduled table if present
+        if has_table_cycling and physical_status is not None:
+            from opentof.quantification import _locate_index_chunks
+            self._original_cycling_status = table_status.copy()
+            discrepancy_log = []
+            for phase_id, phase_name in [(1, "Auto-Zero"), (4, "Sensitivity Cal")]:
+                prog_indices = np.where(table_status == phase_id)[0]
+                if len(prog_indices) == 0:
+                    continue
+                for chunk in _locate_index_chunks(prog_indices, gap_tol=5, min_chunk_size=1):
+                    start_i, end_i = chunk[0], chunk[-1] + 1
+                    agreement = np.sum(physical_status[start_i:end_i] == phase_id) / (end_i - start_i)
+                    if (1.0 - agreement) > mismatch_tolerance:
+                        discrepancy_log.append({
+                            'phase': phase_name, 'start': start_i, 'end': end_i,
+                            'agreement': agreement, 'reason': 'Valve stuck closed or flow missing'
+                        })
+            self.cycling_reconciliation_log = discrepancy_log
 
-        if plot_flag:
-            self._plot_cycling_diagnostics(table_status, final_status, output_dir, plot_filename)
+        # Store physical derivation separately in self._quantification_flags
+        self._quantification_flags = {
+            'type': physical_status if physical_status is not None else table_status.copy()
+        }
+
+        # Keep self._cycling_status['type'] aligned with scheduled/clean DAQ table
+        self._cycling_status['type'] = table_status
 
         return self
 
@@ -1466,9 +1578,16 @@ class Deployment:
                 for key in self._cycling_status:
                     self._cycling_status[key] = self._cycling_status[key][self._global_sort_idx]
 
+            if getattr(self, '_quantification_flags', None) is not None:
+                for key in self._quantification_flags:
+                    self._quantification_flags[key] = self._quantification_flags[key][self._global_sort_idx]
+
             # Re-sort the corrupted writebuf tracking mask array
             if getattr(self, '_corrupt_flags', None) is not None:
                 self._corrupt_flags = self._corrupt_flags[self._global_sort_idx]
+
+            if getattr(self, '_zero_spectra_flags', None) is not None:
+                self._zero_spectra_flags = self._zero_spectra_flags[self._global_sort_idx]
 
     # ------------------------
     # Wrapper Functions
@@ -1722,6 +1841,10 @@ class Deployment:
         # Guard clause: Enforce requirement that mass calibration must be run first
         if getattr(self, 'calibration', None) is None:
             raise ValueError("Mass calibration has not been run. Please call `calibrate_mass()` first.")
+
+        # Forward internal GAD cache if available
+        if self._averaged_dataset is not None:
+            self.calibration['precomputed_gad'] = self._averaged_dataset
 
         # Resolve base output directory path
         if output_dir is None:
@@ -3399,7 +3522,7 @@ class Deployment:
         # --- 5. Call Backend Code ---
         ppb_bc, sens_axis, bg_corr, working_arr = backend_quantify(
             peak_area_array=signal_array,
-            cycling_dict=getattr(self, 'cycling_status', None),
+            cycling_dict=getattr(self, 'quantification_flags', getattr(self, 'cycling_status', None)),
             cycling_zeros=cycling_zeros,
             cycling_sens_cals=cycling_sens_cals,
             normalization=normalization,
@@ -4644,6 +4767,8 @@ class Deployment:
                 f.create_dataset("raw_peak_width_coeffs", data=np.asarray(self.raw_peak_width_coeffs, dtype="float64"))
             if getattr(self, '_corrupt_flags', None) is not None:
                 f.create_dataset("_corrupt_flags", data=np.asarray(self._corrupt_flags, dtype=bool))
+            if getattr(self, '_zero_spectra_flags', None) is not None:
+                f.create_dataset("_zero_spectra_flags", data=np.asarray(self._zero_spectra_flags, dtype=bool))
 
             # Serialize empirical peak shape grid and area ratio
             if getattr(self, 'peak_shape_interp', None) is not None:
@@ -4691,6 +4816,7 @@ class Deployment:
                 "peak_list": "peak_list",
                 "nm_data": "nm_data",
                 "_cycling_status": "cycling_status",
+                "_quantification_flags": "quantification_flags",
                 "isotopes": "isotopes"
             }
 
@@ -5231,6 +5357,8 @@ class Deployment:
                 self.raw_peak_width_function = np.poly1d(self.raw_peak_width_coeffs)
             if "_corrupt_flags" in h5:
                 self._corrupt_flags = h5["_corrupt_flags"][:]
+            if "_zero_spectra_flags" in h5:
+                self._zero_spectra_flags = h5["_zero_spectra_flags"][:]
 
             # --- Step 3: Re-chunk Out-of-Core TOF Dataset ---
             if "tofdata" in h5:
@@ -5267,6 +5395,7 @@ class Deployment:
                 "peak_list": "peak_list",
                 "nm_data": "nm_data",
                 "cycling_status": "_cycling_status",
+                "quantification_flags": "_quantification_flags",
                 "isotopes": "isotopes"
             }
             for h5_path, attr_name in dict_restore_mappings.items():
